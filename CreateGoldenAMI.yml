@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to create resources for monthly patching hardened AMI
+Parameters:  
+  EC2SecurityGroupId:
+    Type : 'String'
+    Description: Security group Id to launch instances for AMI creation.
+  SubnetId:
+    Type : 'String'
+    Description: Subnet Id to launch instances for AMI creation.
+  PatchingRegion:
+    Type : 'String'
+    Description: Target patching region.
+Conditions:
+  CreateResources: !Equals [!Ref 'AWS::Region', !Ref PatchingRegion]
+Resources:    
+  DynamoGoldenAmiMaster:
+    Condition: CreateResources
+    Type: AWS::DynamoDB::Table    
+    Properties:
+      TableName: Infrastructure-Patching-GoldenAMI-Master
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - 
+          AttributeName: ami_key
+          AttributeType: S        
+      KeySchema: 
+        - 
+          AttributeName: ami_key
+          KeyType: HASH
+       
+          
+  DynamoGoldenAmiStaging:
+    Condition: CreateResources
+    Type: AWS::DynamoDB::Table        
+    Properties:
+      TableName: Infrastructure-Patching-StagingAMI
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - 
+          AttributeName: ami_key
+          AttributeType: S
+        - 
+          AttributeName: ami_creation_timestamp
+          AttributeType: N        
+      KeySchema: 
+        - 
+          AttributeName: ami_key
+          KeyType: HASH
+        - 
+          AttributeName: ami_creation_timestamp
+          KeyType: RANGE          
+  
+  # Lambda common role
+  InfrastructurePatchingRole:
+    Condition: CreateResources  
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Infrastructure-Patching
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+            - ssm.amazonaws.com
+            - ec2.amazonaws.com
+            AWS:
+            - !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+  
+  InfrastructurePatchingProfile:
+    Condition: CreateResources
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - !Ref InfrastructurePatchingRole
+      InstanceProfileName: Infrastructure-Patching-Profile
+      
+  LambdaCreateGoldenAMILogGroup:
+    Condition: CreateResources
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaCreateGoldenAMI}
+      RetentionInDays: 365
+      
+  LambdaCreateGoldenAMI:
+    Condition: CreateResources  
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Infrastructure-Patching-CreateGoldenAMI
+      Description: This lambda function gets AMI Ids from Golden AMI Master Dynamo & creates new golden AMI
+      Handler: index.lambda_handler
+      Role: !GetAtt InfrastructurePatchingRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Runtime: python3.9
+      Environment:
+        Variables:
+          AUTOMATION_EXECUTION_ROLE_NAME: 'Infrastructure-Patching'
+          GOLDEN_AMI_MASTER_TABLE_NAME: 'Infrastructure-Patching-GoldenAMI-Master'
+          GOLDEN_AMI_STAGING_TABLE_NAME: 'Infrastructure-Patching-StagingAMI'
+          UPDATE_STAGING_DYNAMO_LAMBDA_NAME: 'Infrastructure-Patching-UpdateStagingAMIDynamo'
+          SSM_DOCUMENT_NAME: 'Infrastructure-Patching-CreatePatchedGoldenAMI'
+          SSM_DOCUMENT_VERSION: '1'
+          INSTANCES_ENV_TAG: 'QA'
+          PATCHING_INSTANCE_PROFILE: 'Infrastructure-Patching-Profile'
+          SECURITY_GROUP_ID: !Ref EC2SecurityGroupId          
+          SUBNET_ID: !Ref SubnetId
+          INSTANCE_UPTIME: '5'
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import string
+          import uuid
+          import time
+          from boto3.session import Session
+          from datetime import datetime
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          CH = logging.StreamHandler()
+          CH.setLevel(logging.INFO)
+          FORMATTER = logging.Formatter(
+              '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          CH.setFormatter(FORMATTER)
+          LOGGER.addHandler(CH)
+
+          def lambda_handler(event, context):
+              
+            client = boto3.client('sts')
+            aws_account_id = client.get_caller_identity()['Account']
+            
+            #Set initial config values            
+            automation_execution_role_name = os.environ["AUTOMATION_EXECUTION_ROLE_NAME"]
+            golden_ami_master_table_name = os.environ["GOLDEN_AMI_MASTER_TABLE_NAME"]
+            instance_env_tag = os.environ["INSTANCES_ENV_TAG"]
+            patching_instance_profile = os.environ["PATCHING_INSTANCE_PROFILE"] 
+            region = os.environ['AWS_REGION']
+            security_group_id = os.environ["SECURITY_GROUP_ID"]
+            subnet_id = os.environ["SUBNET_ID"]
+            instance_uptime = os.environ["INSTANCE_UPTIME"]
+            update_staging_dynamo_lambda_name = os.environ["UPDATE_STAGING_DYNAMO_LAMBDA_NAME"]
+            ssm_document_name = os.environ["SSM_DOCUMENT_NAME"]
+            ssm_document_version = os.environ["SSM_DOCUMENT_VERSION"]
+            automation_execution_role_arn = f'arn:aws:iam::{aws_account_id}:role/{automation_execution_role_name}'
+            
+            LOGGER.info("Config values fetched to feed SSM-Document : " + ssm_document_name)
+            
+            
+            try:
+              # fetch all golden ami
+              dynamodb = boto3.resource('dynamodb', region_name=region)
+              table = dynamodb.Table(golden_ami_master_table_name)
+              response = table.scan()
+              data = response['Items']
+              LOGGER.info("Golden ami values fetched successfully.")
+
+              # getting current date & timestamp
+              dt=datetime.now()
+              ami_creation_dt=str(dt.strftime("%Y-%m-%d-%I-%M-%S-%p"))
+              ami_creation_ts = int(datetime.timestamp(dt))
+              
+              ts = int(datetime.timestamp(dt))
+              
+              LOGGER.info("ami_creation_dt is : " + ami_creation_dt + "& ami_creation_ts is : " + str(ami_creation_ts))
+              
+              for item in data:
+              
+                ami_key = item['ami_key']
+                ami_id = item['ami_id']
+                ami_instance_type = item['ami_instance_type']
+                
+                parms = {
+                  'sourceAMIid' : [ami_id],
+                  'subnetId' : [subnet_id],
+                  'targetAMIname' : [ami_key+"-"+ami_creation_dt],
+                  'instanceProfileRoleName' : [patching_instance_profile],
+                  'updateStagingDynamoLambdaName': [update_staging_dynamo_lambda_name],
+                    'instancesEnvironmentTag': [instance_env_tag],
+                    'sourceAMIKey': [ami_key],
+                  'securitygroupId': [security_group_id],
+                  'automationAssumeRole': [automation_execution_role_arn],
+                  'amiCreationDt': [ami_creation_dt],
+                  'amiCreationTs': [str(ami_creation_ts)],
+                  'instanceUptime': [instance_uptime],
+                  'amiInstanceType': [ami_instance_type]
+                }
+                  
+                try:
+                  # trigger SSM automation to patch instance & create new hardened ami
+                  LOGGER.info("Invoking Infrastructure-Patching-CreatePatchedGoldenAMI SSM document for AMI Key : " + ami_key + " => " + ami_id )
+                  client = boto3.client('ssm')
+                  response = client.start_automation_execution(
+                      DocumentName=ssm_document_name,
+                      DocumentVersion=ssm_document_version,
+                      Parameters=parms,    
+                      TargetLocations=[
+                      {
+                        'Accounts': [aws_account_id],
+                        'Regions': [region],			
+                        'ExecutionRoleName': automation_execution_role_name
+                      }
+                    ]
+                  )
+                  
+                  automation_execution_id = response["AutomationExecutionId"]
+                  LOGGER.info("Started Infrastructure-Patching-CreatePatchedGoldenAMI SSM document with execution id : "+ automation_execution_id + " for AMI Key : " + ami_key + " => " + ami_id)
+                  automation_execution_status = "Pending"
+                  golden_staging_ami_table_name = os.environ["GOLDEN_AMI_STAGING_TABLE_NAME"]
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(golden_staging_ami_table_name)
+                  
+                  LOGGER.info("Updating Staging Dynamo table : " + golden_staging_ami_table_name + " for AMI Key : " + ami_key)
+                  response=table.put_item(Item= {'ami_key': ami_key,'ami_creation_timestamp': ami_creation_ts , 'ami_creation_date': ami_creation_dt,  'source_ami_id': ami_id, 'automation_execution_id': automation_execution_id, 'automation_execution_status' : automation_execution_status   })
+                  if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    LOGGER.info("Success - Updated table " + golden_staging_ami_table_name + " new_ami_id for ami_key : " + ami_key)
+                  else:
+                    LOGGER.info("Failed - Updated table " + golden_staging_ami_table_name + " new_ami_id for ami_key : " + ami_key)
+                except Exception as exp:
+                    LOGGER.error("Exception while invoking Infrastructure-Patching-CreatePatchedGoldenAMI SSM document "+ str(exp))
+
+            except Exception as exp:
+              LOGGER.error(str(exp))
+  
+  LambdaUpdateStagingAMIDynamoLogGroup:
+    Condition: CreateResources
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaUpdateStagingAMIDynamo}
+      RetentionInDays: 365
+      
+  LambdaUpdateStagingAMIDynamo:
+    Condition: CreateResources  
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Infrastructure-Patching-UpdateStagingAMIDynamo
+      Description: This lambda function updates new golden AMI ID in staging Dynamo table
+      Handler: index.lambda_handler
+      Role: !GetAtt InfrastructurePatchingRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Runtime: python3.9
+      Environment:
+        Variables:          
+          STAGING_AMI_DYNAMO_TABLE_NAME: 'Infrastructure-Patching-StagingAMI'          
+      Code:
+        ZipFile: |          
+          import json
+          import boto3
+          import os
+          import logging
+          import datetime
+          import time
+          from datetime import datetime
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          CH = logging.StreamHandler()
+          CH.setLevel(logging.INFO)
+          FORMATTER = logging.Formatter(
+              '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          CH.setFormatter(FORMATTER)
+          LOGGER.addHandler(CH)
+
+
+          def lambda_handler(event, context):
+            try:
+                
+              print("Received event: " + json.dumps(event, indent=2))
+              
+              staging_ami_dynamo_table_name = os.environ["STAGING_AMI_DYNAMO_TABLE_NAME"]
+              ami_key= event['sourceAMIKey']
+              new_ami_id = event['newAmiID']
+              source_ami_id = event['sourceAMIid']
+              automation_execution_id = event['automation_Execution_Id']
+              ami_creation_date = event['amiCreationDt']
+              ami_creation_timestamp = int(event['amiCreationTs'])
+              patched_instance_id = event['patchedInstanceId']
+              
+              LOGGER.info("Successfully fetched configs from event...")
+              
+              
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(staging_ami_dynamo_table_name)
+              LOGGER.info("Updating dynamo table : " + staging_ami_dynamo_table_name)
+              
+              update = table.update_item(
+              Key={
+                  'ami_key': ami_key,
+                  'ami_creation_timestamp':ami_creation_timestamp
+              },
+              ConditionExpression= 'attribute_exists(ami_key)',
+              UpdateExpression='SET new_ami_id = :new_ami_id, patched_instance_id = :patched_instance_id, automation_execution_status = :automation_execution_status',
+              ExpressionAttributeValues={
+                  ':new_ami_id': new_ami_id,
+                  ':patched_instance_id': patched_instance_id,
+                  ':automation_execution_status': 'Success'
+              }
+              )
+             
+              if update['ResponseMetadata']['HTTPStatusCode'] == 200:
+                LOGGER.info("Success - Updated table " + staging_ami_dynamo_table_name + "new_ami_id for ami_key : " + ami_key)
+              else:
+                LOGGER.info("Failed - Updated table " + staging_ami_dynamo_table_name + "new_ami_id for ami_key : " + ami_key)
+
+            except Exception as exp:        
+              LOGGER.error(str(exp))
+
+
+# SSM Document to create Golden AMIS
+  ASGEC2PatchDocument:
+    Condition: CreateResources
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: Infrastructure-Patching-CreatePatchedGoldenAMI
+      Content: 
+        outputs:
+        - createImage.ImageId
+        schemaVersion: '0.3'
+        description: Systems Manager Automation for Patching Golden AMI and updating in staging dynamo
+          table
+        assumeRole: "{{ automationAssumeRole }}"
+        parameters:
+          subnetId:
+            description: The SubnetId where the instance is launched from the sourceAMIid.
+            type: String
+          amiCreationTs:
+            description: AMI Creation Date in Timestamp.
+            type: String
+          instancesEnvironmentTag:
+            description: if to refresh instances whith bew launch config.
+            type: String
+          amiCreationDt:
+            description: AMI Creation Date & Time.
+            type: String
+          sourceAMIid:
+            description: AMI to patch
+            type: String
+          sourceAMIKey:
+            description: AMI Key patch
+            type: String
+          securitygroupId:
+            description: security group for the intermediate instance
+            type: StringList
+          targetAMIname:
+            default: patchedAMI-{{global:DATE_TIME}}
+            description: Name of new AMI
+            type: String
+          installOverrideList:
+            default: ''
+            description: "(Optional) An https URL or an Amazon S3 path-style URL to the list
+              of patches to be installed. This patch installation list overrides the patches
+              specified by the default patch baseline."
+            type: String
+          updateStagingDynamoLambdaName:
+            description: The name of the lambda function that updates staging dynamo.
+            type: String
+          instanceProfileRoleName:
+            description: The name of the instance profile role to assume.
+            type: String
+          automationAssumeRole:
+            description: The ARN of the Automation service role to assume.
+            type: String
+          instanceUptime:
+            description: Patched Instance uptime before stopping it
+            type: String
+          amiInstanceType:
+            description: Instance Type to use for specific golden ami
+            type: String
+           
+        mainSteps:
+        - maxAttempts: 1
+          inputs:
+            IamInstanceProfileName: "{{ instanceProfileRoleName }}"
+            MaxInstanceCount: 1
+            TagSpecifications:
+            - ResourceType: instance
+              Tags:
+              - Value: "{{ instancesEnvironmentTag }}"
+                Key: Patch Group
+              - Value: "{{ sourceAMIKey }}"
+                Key: Name
+            ImageId: "{{ sourceAMIid }}"
+            SubnetId: "{{ subnetId }}"
+            InstanceType: "{{ amiInstanceType }}"
+            SecurityGroupIds: "{{ securitygroupId }}"
+            MinInstanceCount: 1
+          name: startInstances
+          action: aws:runInstances
+          timeoutSeconds: 1200
+          onFailure: Abort
+        - maxAttempts: 1
+          inputs:
+            Parameters:
+              InstallOverrideList: "{{ installOverrideList }}"
+              Operation: Install
+            InstanceIds:
+            - "{{ startInstances.InstanceIds }}"
+            DocumentName: AWS-RunPatchBaseline
+          name: runPatchBaseline
+          action: aws:runCommand
+          onFailure: Abort
+        - maxAttempts: 1
+          name: sleep
+          action: 'aws:sleep'
+          inputs:
+            Duration: 'PT{{ instanceUptime }}M'        
+        - maxAttempts: 1
+          inputs:
+            DesiredState: stopped
+            InstanceIds:
+            - "{{ startInstances.InstanceIds }}"
+          name: stopInstance
+          action: aws:changeInstanceState
+          onFailure: Abort
+        - maxAttempts: 1
+          inputs:
+            ImageName: "{{ targetAMIname }}"
+            InstanceId: "{{ startInstances.InstanceIds }}"
+            ImageDescription: AMI created by EC2 Automation
+            NoReboot: true
+          name: createImage
+          action: aws:createImage
+          onFailure: Abort
+        - maxAttempts: 1
+          inputs:
+            DesiredState: terminated
+            InstanceIds:
+            - "{{ startInstances.InstanceIds }}"
+          name: terminateInstance
+          action: aws:changeInstanceState
+          onFailure: Abort
+        - maxAttempts: 1
+          inputs:
+            FunctionName: "{{ updateStagingDynamoLambdaName }}"
+            Payload: '{"sourceAMIKey":"{{sourceAMIKey}}","sourceAMIid":"{{sourceAMIid}}",
+              "newAmiID":"{{createImage.ImageId}}", "newAmiID":"{{createImage.ImageId}}",
+              "automation_Execution_Id":"{{automation:EXECUTION_ID}}","patchedInstanceId":"{{startInstances.InstanceIds}}",
+              "amiCreationDt":"{{amiCreationDt}}", "amiCreationTs":"{{amiCreationTs}}" }'
+          name: updateStagingAMIDynamo
+          action: aws:invokeLambdaFunction
+          timeoutSeconds: 1200
+          onFailure: Abort

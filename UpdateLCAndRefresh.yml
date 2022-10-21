@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation template to create resources for hardened AMI propogation
+  over multiple ASG
+Parameters:
+  PatchingAutomationRoleArn:
+    Type: String
+    Description: Provide Patching Automation Role Arn created in previous stack/step.
+  PatchingRegion:
+    Type: String
+    Description: Target patching region.
+  Env:
+    Type: String
+    Description: Environment Name
+Conditions:
+  CreateResources: !Equals 
+    - !Ref 'AWS::Region'
+    - !Ref PatchingRegion
+Resources:
+  DynamoASGRefreshStatus:
+    Condition: CreateResources
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: Infrastructure-Patching-ASGRefreshStatus
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: asg_name
+          AttributeType: S
+        - AttributeName: asg_refresh_timestamp
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: asg_name
+          KeyType: HASH
+        - AttributeName: asg_refresh_timestamp
+          KeyType: RANGE
+  LambdaCreateLaunchConfigsLogGroup:
+    Condition: CreateResources
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaCreateLaunchConfigs}'
+      RetentionInDays: 365
+  LambdaCreateLaunchConfigs:
+    Condition: CreateResources
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Infrastructure-Patching-CreateLaunchConfigs
+      Description: This lambda function fetch all ASGs tag with specific AMI ID & creates new launch config.
+      Handler: index.lambda_handler
+      Role: !Ref PatchingAutomationRoleArn
+      Timeout: 900
+      MemorySize: 512
+      Runtime: python3.9
+      Environment:
+        Variables:
+          AUTOMATION_EXECUTION_ROLE_NAME: Infrastructure-Patching
+          ASG_REFRESH_STATUS_TABLE_NAME: Infrastructure-Patching-ASGRefreshStatus
+          GOLDEN_AMI_STAGING_TABLE_NAME: Infrastructure-Patching-StagingAMI
+          RECYCLE_INSTANCES_LAMBDA_NAME: Infrastructure-Patching-RecycleASG
+          SSM_DOCUMENT_NAME: Infrastructure-Patching-UpdateLaunchConfigAndRecycleASG
+          SSM_DOCUMENT_VERSION: '1'
+          INSTANCES_ENV_TAG: !Ref Env
+          DELAY_IN_MINUTES: 1
+          INSTANCE_WARMUP: 120
+          REFRESH_ASG_INSTANCES: 'Yes'
+          RETAIN_HEALTHY_PERCENTAGE: 50
+          REVERT_ASG_SIZE_LAMBDA_NAME: Infrastructure-Patching-RevertASGSize
+          TARGET_LOCATION_MAX_CONCURRENCY: 1
+          TARGET_LOCATION_MAX_ERRORS: 1
+          IS_ZERO_DOWN_TIME: 'No'
+          
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import string
+          import uuid
+          from boto3.session import Session
+          from datetime import datetime
+          import base64
+          import time
+          from boto3.dynamodb.conditions import Key
+
+          #logger initiatlization
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          CH = logging.StreamHandler()
+          CH.setLevel(logging.INFO)
+          FORMATTER = logging.Formatter(
+              '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          CH.setFormatter(FORMATTER)
+          LOGGER.addHandler(CH)
+
+
+          def invoke_ssm_doc(asg_name,asg_lc_name,desired_capacity,min_size,max_size,ami_key,is_zero_down_time,delay_in_minutes): 
+              
+              client = boto3.client('sts')
+              aws_account_id = client.get_caller_identity()['Account']
+              automation_execution_role_name = os.environ["AUTOMATION_EXECUTION_ROLE_NAME"]
+              instance_env_tag = os.environ["INSTANCES_ENV_TAG"]
+              region = os.environ["AWS_REGION"]
+              ssm_document_name = os.environ["SSM_DOCUMENT_NAME"]
+              ssm_document_version = os.environ["SSM_DOCUMENT_VERSION"]
+              automation_execution_role_arn = f'arn:aws:iam::{aws_account_id}:role/{automation_execution_role_name}'
+              retain_healthy_percentage = os.environ["RETAIN_HEALTHY_PERCENTAGE"]
+              instance_warmup = os.environ["INSTANCE_WARMUP"]
+              refresh_asg_instances = os.environ["REFRESH_ASG_INSTANCES"]
+              target_location_max_concurrency = os.environ["TARGET_LOCATION_MAX_CONCURRENCY"]
+              target_location_max_errors = os.environ["TARGET_LOCATION_MAX_ERRORS"]
+              recycle_instances_lambda_name = os.environ["RECYCLE_INSTANCES_LAMBDA_NAME"]
+              revert_asg_size_lambda_name = os.environ["REVERT_ASG_SIZE_LAMBDA_NAME"]
+              
+              
+              LOGGER.info("Config values fetched to feed SSM-Document : " + ssm_document_name)
+              
+               # getting current date & timestamp
+              dt=datetime.now()
+              asg_refresh_dt=str(dt.strftime("%Y-%m-%d-%I-%M-%S-%p"))
+              asg_refresh_ts = int(datetime.timestamp(dt))
+               
+              parms = {
+                      'automationAssumeRole': [automation_execution_role_arn],
+                      'asgName' : [asg_name],
+                      'asgLcName' : [asg_lc_name],
+                      'asgDesiredCount' : [str(desired_capacity)],
+                      'asgMinSize' : [str(min_size)],
+                      'asgMaxSize' : [str(max_size)],
+                      'retainHealthyPercentage': [retain_healthy_percentage],
+                      'refreshASGInstances': [refresh_asg_instances],
+                      'instancesEnvironmentTag': [instance_env_tag],
+                      'recycleInstancesLambdaName': [recycle_instances_lambda_name],
+                      'revertASGSizeLambdaName': [revert_asg_size_lambda_name],
+                      'delayInMinutes': [delay_in_minutes],
+                      'asgRefreshDt': [asg_refresh_dt],
+                      'asgRefreshTs': [str(asg_refresh_ts)],
+                      'isZeroDownTime': [is_zero_down_time],
+                      'instanceWarmup': [instance_warmup]
+                      
+                  }
+
+              response = ssm_client.start_automation_execution(
+                  DocumentName=f'{ssm_document_name}',
+                  Parameters=parms,
+                  TargetLocations=[
+                      {
+                          'Accounts': [aws_account_id],
+                          'Regions': [region],
+                          'TargetLocationMaxConcurrency': target_location_max_concurrency,
+                          'TargetLocationMaxErrors': target_location_max_errors,
+                          'ExecutionRoleName': automation_execution_role_name
+                      }
+                  ]                    
+              )
+              
+              automation_execution_id = response["AutomationExecutionId"]
+              LOGGER.info("Started Infrastructure-Patching-UpdateLaunchConfigAndRecycleASG SSM document with execution id : "+ automation_execution_id + " for ASG : " + asg_name)
+              automation_execution_status = "Pending"
+              asg_refresh_status_table_name = os.environ["ASG_REFRESH_STATUS_TABLE_NAME"]
+              table = dynamodb.Table(asg_refresh_status_table_name)
+              
+              LOGGER.info("Updating Dynamo table : " + asg_refresh_status_table_name + " for ASG  : " + asg_name)
+              response=table.put_item(Item= {'asg_name': asg_name,'asg_refresh_timestamp': asg_refresh_ts , 'asg_refresh_date': asg_refresh_dt,'asg_lc_name': asg_lc_name,  'ami_key': ami_key, 'automation_execution_id': automation_execution_id, 'automation_execution_status' : automation_execution_status   })
+              if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                  LOGGER.info("Success - Updated table " + asg_refresh_status_table_name + " for ASG : " + asg_name)
+              else:
+                  LOGGER.info("Failed - Updated table " + asg_refresh_status_table_name + " for ASG : " + asg_name)
+
+          ssm_client = boto3.client('ssm')        
+          sts_client = boto3.client('sts')
+          asg_client = boto3.client('autoscaling')
+
+          #dynamodb_client = boto3.client('dynamodb', region_name="us-east-1")
+          # Creating the DynamoDB Table Resource
+          region = os.environ["AWS_REGION"]
+          golden_staging_ami_table_name = os.environ["GOLDEN_AMI_STAGING_TABLE_NAME"]
+          is_zero_down_time = os.environ["IS_ZERO_DOWN_TIME"]
+          delay_in_minutes = os.environ["DELAY_IN_MINUTES"]
+          dynamodb = boto3.resource('dynamodb', region_name=region)
+          table = dynamodb.Table(golden_staging_ami_table_name)
+
+          def lambda_handler(event,context):
+              
+              try:
+                  ami_key=event['ami_key']
+                  LOGGER.info("Received Golden AMI Key : " + ami_key)
+                  
+                  # Getting the current date and time
+                  dt = datetime.now()
+                  # getting the timestamp
+                  ts = int(datetime.timestamp(dt))
+                  print("Timestamp is:", ts)
+                  
+                  response = table.query(
+                    KeyConditionExpression=Key('ami_key').eq(ami_key),
+                    ScanIndexForward=False,
+                    Limit=1
+                  )
+
+                                    
+                  new_ami_id = response['Items'][0]['new_ami_id']
+                  LOGGER.info("Fetched New AMI ID : " + new_ami_id + " for Golden AMI Key : " + ami_key)
+                  
+                  paginator = asg_client.get_paginator('describe_auto_scaling_groups')
+                  page_iterator = paginator.paginate(
+                      PaginationConfig={'PageSize': 100}
+                  )
+              
+                  response = page_iterator.search(
+                      'AutoScalingGroups[] | [?contains(Tags[?Key==`{}`].Value, `{}`) && contains(Tags[?Key==`{}`].Value, `{}`)]'.format(
+                          'ami_key', ami_key, 'ApplyPatches', 'On') 
+                  )
+                  
+                  for group in response:
+                      failed = False
+                      asg_name = group['AutoScalingGroupName']
+                      asg_lc_name = group['LaunchConfigurationName']
+                      min_size = int(group['MinSize'])
+                      max_size = int(group['MaxSize'])
+                      desired_capacity = int(group['DesiredCapacity'])
+                      print(asg_name)
+                     
+                      try:
+                          
+                          if desired_capacity > 0 :
+                              lc_object_tmp = asg_client.describe_launch_configurations(LaunchConfigurationNames=[group['LaunchConfigurationName']])['LaunchConfigurations'][0]
+                              print(lc_object_tmp)
+                              key_name =  lc_object_tmp['KeyName']
+                              security_groups =  lc_object_tmp['SecurityGroups']
+                              user_data =  lc_object_tmp['UserData']
+                              instance_type =  lc_object_tmp['InstanceType']
+                              kernel_id =  lc_object_tmp['KernelId']
+                              ram_disk_id =  lc_object_tmp['RamdiskId']
+                              block_device_mappings =  lc_object_tmp['BlockDeviceMappings']
+                              instance_monitoring =  lc_object_tmp['InstanceMonitoring']
+                              iam_instance_profile =  lc_object_tmp['IamInstanceProfile']
+                              ebs_optimized =  lc_object_tmp['EbsOptimized']
+                              associate_public_ipAddress = False
+                              
+                              #print(asg_name)
+                              #print(asg_lc_name)
+                              #print(key_name)
+                              #print(security_groups)
+                              #print(user_data)
+                              #print(instance_type)
+                              #print(kernel_id)
+                              #print(ram_disk_id)
+                              #print(block_device_mappings)
+                              #print(instance_monitoring)
+                              #print(iam_instance_profile)
+                              #print(ebs_optimized)
+                              #print(associate_public_ipAddress)
+                              
+                              str_date_time=datetime.now().strftime("%Y-%m-%d-%I-%M-%S-%p")
+                              
+                              tmp_lc_name = asg_lc_name
+                              if "EC2LaunchConfig" in asg_lc_name:
+                                tmp_lc_name = asg_lc_name.split("-EC2LaunchConfig-")[0]
+                              elif "date" in asg_lc_name:
+                                tmp_lc_name = asg_lc_name.split("-pdate-")[0]
+                              
+                              new_launch_config = tmp_lc_name+'-pdate-'+str_date_time
+                              
+                              response = asg_client.create_launch_configuration(
+                                  LaunchConfigurationName=new_launch_config,
+                                  ImageId=new_ami_id,
+                                  KeyName=key_name,
+                                  SecurityGroups=security_groups,
+                                  UserData=base64.b64decode(user_data),
+                                  InstanceType=instance_type,
+                                  InstanceMonitoring=instance_monitoring,
+                                  IamInstanceProfile=iam_instance_profile,
+                                  EbsOptimized=ebs_optimized,
+                                  AssociatePublicIpAddress=associate_public_ipAddress,
+                                  BlockDeviceMappings=block_device_mappings
+                                 
+                              )
+                              
+                              if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                                  LOGGER.info("Success - New LaunchConfiguration created for new_ami_id : " + new_ami_id + " => ami_key : " + ami_key)
+                                  
+                                  if is_zero_down_time == "Yes" :
+                                      
+                                      LOGGER.info("is_zero_down_time flag is Yes for " + asg_name + " so need to double existing capacity.")
+                                      # doube existing capacity
+                                      new_desired_capacity= desired_capacity+desired_capacity
+                                      new_min_size= min_size+min_size
+                                      new_max_size= max_size+max_size
+                                      
+                                      # update ASG to Increase instance count
+                                      response = asg_client.update_auto_scaling_group(AutoScalingGroupName = asg_name, DesiredCapacity=new_desired_capacity, MaxSize=new_max_size, MinSize=new_min_size)
+                                      
+                                      if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                                          LOGGER.info("Success - AutoScalingGroup " + asg_name + " updated to double existing capacity. calling invoke_ssm_doc for " + asg_name )
+                                          invoke_ssm_doc(asg_name,new_launch_config,desired_capacity,min_size,max_size,ami_key,is_zero_down_time,delay_in_minutes)
+                                      else:
+                                          LOGGER.info("Failed - AutoScalingGroup " + asg_name + " updated to double existing capacity ")
+                                  else:
+                                      LOGGER.info("is_zero_down_time flag is not Yes for " + asg_name + " so no need to double existing capacity.. calling invoke_ssm_doc for " + asg_name )
+                                      invoke_ssm_doc(asg_name,new_launch_config,desired_capacity,min_size,max_size,ami_key, is_zero_down_time, '1')
+                              
+                              else:
+                                  LOGGER.info("Failed - New LC creation failed for new_ami_id : " + new_ami_id + " =>  ami_key : " + ami_key)
+                        
+                              
+                          else: 
+                              LOGGER.info("DesiredCapacity is set as 0 for ASG : " + asg_name + " - no action needed.")
+                         
+                      except Exception as exp:
+                          LOGGER.error("Launch configuration issue : "+str(exp))
+                  
+                  
+              except Exception as exp:  
+                  LOGGER.error("Some exception thrown"+str(exp))
+
+  LambdaRecycleASGLogGroup:
+    Condition: CreateResources
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaRecycleASG}'
+      RetentionInDays: 365
+  LambdaRecycleASG:
+    Condition: CreateResources
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Infrastructure-Patching-RecycleASG
+      Description: This lambda function update new launch config into ASG & recycles EC2 instances
+      Handler: index.lambda_handler
+      Role: !Ref PatchingAutomationRoleArn
+      Timeout: 900
+      MemorySize: 512
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import string
+          import uuid
+          from boto3.session import Session
+          from datetime import datetime
+          import base64
+          import time
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          CH = logging.StreamHandler()
+          CH.setLevel(logging.INFO)
+          FORMATTER = logging.Formatter(
+              '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          CH.setFormatter(FORMATTER)
+          LOGGER.addHandler(CH)
+
+          def lambda_handler(event,context):
+              try:
+                  
+                  asg_name=event['asgName']
+                  asg_lc_name=event['asgLcName']
+                  retainHealthyPercentage=event['retainHealthyPercentage']
+                  instanceWarmup=event['instanceWarmup']
+                  refreshASGInstances=event['refreshASGInstances']
+                  instancesEnvironmentTag=event['instancesEnvironmentTag']
+                  
+                  asg_client = boto3.client('autoscaling')
+                 
+                  LOGGER.info("Updateing ASG : " + asg_name + " with new launch configuration : " + asg_lc_name)
+                  response = asg_client.update_auto_scaling_group(AutoScalingGroupName = asg_name,LaunchConfigurationName = asg_lc_name)
+                  
+                  LOGGER.info("Refresging ASG : " + asg_name + " with new instances..")
+                  response = asg_client.start_instance_refresh(
+                      AutoScalingGroupName=asg_name,
+                      Strategy='Rolling',
+                      Preferences={
+                          'MinHealthyPercentage': int(retainHealthyPercentage),
+                          'InstanceWarmup': int(instanceWarmup)
+                          
+                      })
+                  
+              except Exception as exp:
+                  LOGGER.error('Launch configuration not found '+str(exp))
+  LambdaRevertASGSizeLogGroup:
+    Condition: CreateResources
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaRevertASGSize}'
+      RetentionInDays: 365
+  LambdaRevertASGSize:
+    Condition: CreateResources
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Infrastructure-Patching-RevertASGSize
+      Description: This lambda function runs patch-baseline scan operation & revert ASG to its original size if its zero down time deployment.
+      Handler: index.lambda_handler
+      Role: !Ref PatchingAutomationRoleArn
+      Timeout: 900
+      MemorySize: 512
+      Runtime: python3.9
+      Environment:
+        Variables:
+          ASG_REFRESH_STATUS_TABLE_NAME: Infrastructure-Patching-ASGRefreshStatus
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          import string
+          import uuid
+          import base64
+          import time
+          from boto3.session import Session
+          from datetime import datetime
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          CH = logging.StreamHandler()
+          CH.setLevel(logging.INFO)
+          FORMATTER = logging.Formatter(
+              '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+          CH.setFormatter(FORMATTER)
+          LOGGER.addHandler(CH)
+
+          def lambda_handler(event,context):
+              try:
+                  LOGGER.info(event)
+                  asg_name=event['asgName']
+                  asgDesiredCount=int(event['asgDesiredCount'])
+                  asgMinSize=int(event['asgMinSize'])
+                  asgMaxSize=int(event['asgMaxSize'])
+                  instancesEnvironmentTag=event['instancesEnvironmentTag']
+                  asgRefreshDt=event['asgRefreshDt']
+                  asgRefreshTs=int(event['asgRefreshTs'])
+                  isZeroDownTime=event['isZeroDownTime']
+                  print(asg_name) 
+                  
+                  asg_client = boto3.client('autoscaling')
+                  ssm_client = boto3.client('ssm')
+                  
+                  asg_response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+                  
+                  instance_ids = [] # List to hold the instance-ids
+                  
+                  for i in asg_response['AutoScalingGroups']:
+                      for k in i['Instances']:
+                          print(k['InstanceId'])
+                          instance_ids.append(k['InstanceId'])
+                          
+                  response=ssm_client.send_command(
+                    InstanceIds=instance_ids,
+                    DocumentName='AWS-RunPatchBaseline',
+                    DocumentVersion='$LATEST',
+                    TimeoutSeconds=1800,
+                    Comment='PostPatchingScan',
+                    Parameters={
+                      'Operation': [
+                        'Scan'
+                      ],
+                      'RebootOption': [
+                        'NoReboot'
+                      ]
+                    }
+                  )
+                  
+                  scan_run_command_id = response['Command']['CommandId']
+                  ## print run command if for patch-base line scan
+                  print(scan_run_command_id)
+                  
+                  if isZeroDownTime == "Yes" :
+                      LOGGER.info("Updating ASG instances to its original size for ASG  : " + asg_name)
+                       # update ASG to decrease instance count
+                      response = asg_client.update_auto_scaling_group(AutoScalingGroupName = asg_name, DesiredCapacity=asgDesiredCount, MaxSize=asgMaxSize, MinSize=asgMinSize)
+                  
+                  asg_refresh_status_table_name = os.environ["ASG_REFRESH_STATUS_TABLE_NAME"]
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(asg_refresh_status_table_name)
+                  
+                  LOGGER.info("Updating table " + asg_refresh_status_table_name + " for ASG  : " + asg_name)
+                  update = table.update_item(
+                  Key={
+                      'asg_name': asg_name,
+                      'asg_refresh_timestamp':asgRefreshTs
+                  },
+                  UpdateExpression='SET automation_execution_status = :automation_execution_status, scan_run_command_id = :scan_run_command_id',
+                  ExpressionAttributeValues={
+                      ':automation_execution_status': 'Success',
+                      ':scan_run_command_id': scan_run_command_id,
+                  }
+                  )
+                 
+                  if update['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      LOGGER.info("Success - Updated table " + asg_refresh_status_table_name + " for ASG  : " + asg_name)
+                  else:
+                      LOGGER.info("Failed - Updated table " + asg_refresh_status_table_name + " for ASG  : " + asg_name)
+              except Exception as exp:
+                  LOGGER.error('Launch configuration not found '+str(exp))
+        
+
+                  
+  ASGEC2PatchDocument:
+    Condition: CreateResources
+    Type: 'AWS::SSM::Document'
+    Properties:
+      DocumentType: Automation
+      Name: Infrastructure-Patching-UpdateLaunchConfigAndRecycleASG
+      Content:        
+        description: Systems Manager Automation - Update ASG with new Launch Config & Recycle instances
+        schemaVersion: '0.3'
+        assumeRole: '{{ automationAssumeRole }}'
+        parameters:
+          automationAssumeRole:
+            description: The ARN of the Automation service role to assume.
+            type: String
+          instancesEnvironmentTag:
+            description: if to refresh instances whith bew launch config.
+            type: String
+          recycleInstancesLambdaName:
+            description: The name of the recycle Instances Lambda function.
+            type: String
+          revertASGSizeLambdaName:
+            description: The name of Lambda function that bring ASG to its original size.
+            type: String
+          asgName:
+            description: Target ASG Name
+            type: String
+          asgLcName:
+            description: Target ASG Launch Config Name
+            type: String
+          asgDesiredCount:
+            description: Target ASG Original Desired Instances count
+            type: String
+          asgMinSize:
+            description: Target ASG Original Minimum Instances count
+            type: String
+          asgMaxSize:
+            description: Target ASG Original Maximum Instances count
+            type: String
+          retainHealthyPercentage:
+            description: Percentage of boxes to retain as healthy while recycle
+            type: String
+          refreshASGInstances:
+            description: 'Refresh ASG flag Yes/No? '
+            type: String
+          delayInMinutes:
+            description: Bootstrap time for new instance to get into service
+            type: String
+          asgRefreshDt:
+            description: Start date-time for ASG to refresh instances
+            type: String
+          asgRefreshTs:
+            description: Start date-time(timestamp) for ASG to refresh instances
+            type: String
+          isZeroDownTime:
+            description: Do you need zero time while recycling boxes.
+            type: String
+          instanceWarmup:
+            description: Instance warmup time(in secs) during refresh
+            type: String
+        mainSteps:
+          - maxAttempts: 1
+            name: sleep
+            action: 'aws:sleep'
+            inputs:
+              Duration: 'PT{{ delayInMinutes }}M'
+          - maxAttempts: 1
+            inputs:
+              FunctionName: '{{ recycleInstancesLambdaName }}'
+              Payload: '{"instancesEnvironmentTag":"{{instancesEnvironmentTag}}", "asgName":"{{asgName}}","asgLcName":"{{asgLcName}}",        "retainHealthyPercentage":"{{retainHealthyPercentage}}", "refreshASGInstances":"{{refreshASGInstances}}", "instanceWarmup":"{{instanceWarmup}}" }'
+            name: updateLaunchConfigRecycleASG
+            action: 'aws:invokeLambdaFunction'
+            timeoutSeconds: 1200
+            onFailure: Abort
+            nextStep: stepSelection
+          - maxAttempts: 1
+            inputs:
+              Choices:
+                - EqualsIgnoreCase: 'Yes'
+                  Variable: '{{refreshASGInstances}}'
+                  NextStep: waitForRefreshAction
+            name: stepSelection
+            action: 'aws:branch'
+            timeoutSeconds: 600
+            onFailure: Abort
+            isEnd: true
+          - inputs:
+              PropertySelector: '$.InstanceRefreshes[0].Status'
+              DesiredValues:
+                - Successful
+              AutoScalingGroupName: '{{ asgName }}'
+              Service: autoscaling
+              Api: DescribeInstanceRefreshes
+            name: waitForRefreshAction
+            action: 'aws:waitForAwsResourceProperty'
+            timeoutSeconds: 2000
+            onFailure: Continue
+          - maxAttempts: 1
+            inputs:
+              FunctionName: '{{ revertASGSizeLambdaName }}'
+              Payload: '{"instancesEnvironmentTag":"{{instancesEnvironmentTag}}", "asgName":"{{asgName}}",  "asgDesiredCount":"{{asgDesiredCount}}", "asgMinSize":"{{asgMinSize}}","asgMaxSize":"{{asgMaxSize}}","asgRefreshDt":"{{asgRefreshDt}}","asgRefreshTs":"{{asgRefreshTs}}", "isZeroDownTime":"{{isZeroDownTime}}"       }'
+            name: revertASGSize
+            action: 'aws:invokeLambdaFunction'
+            timeoutSeconds: 1200
+            onFailure: Abort
